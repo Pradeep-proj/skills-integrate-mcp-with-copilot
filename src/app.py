@@ -10,6 +10,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+import json
+from datetime import datetime, timedelta
+import secrets
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +21,17 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+# Load teacher credentials from JSON
+def load_teachers():
+    teachers_file = os.path.join(current_dir, "teachers.json")
+    with open(teachers_file, 'r') as f:
+        return json.load(f)["teachers"]
+
+TEACHERS = load_teachers()
+
+# In-memory session storage (maps session token to teacher username and expiration)
+sessions = {}
 
 # In-memory activity database
 activities = {
@@ -83,14 +97,71 @@ def root():
     return RedirectResponse(url="/static/index.html")
 
 
+# Helper function to verify teacher session
+def verify_teacher_session(token: str):
+    """Verify that a token is valid and belongs to an authenticated teacher"""
+    if token not in sessions:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    session = sessions[token]
+    if datetime.now() > session["expiration"]:
+        del sessions[token]
+        raise HTTPException(status_code=401, detail="Session expired")
+    
+    return session["username"]
+
+
+@app.post("/login")
+def login(username: str, password: str):
+    """Teacher login endpoint"""
+    if username not in TEACHERS:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    if TEACHERS[username] != password:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    # Create a new session token
+    token = secrets.token_urlsafe(32)
+    sessions[token] = {
+        "username": username,
+        "expiration": datetime.now() + timedelta(hours=8)
+    }
+    
+    return {"token": token, "username": username}
+
+
+@app.post("/logout")
+def logout(token: str):
+    """Teacher logout endpoint"""
+    if token in sessions:
+        del sessions[token]
+    return {"message": "Logged out successfully"}
+
+
+@app.get("/verify-session")
+def verify_session(token: str):
+    """Verify if a teacher session is valid"""
+    try:
+        username = verify_teacher_session(token)
+        return {"authenticated": True, "username": username}
+    except HTTPException:
+        return {"authenticated": False}
+
+
 @app.get("/activities")
 def get_activities():
     return activities
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
-    """Sign up a student for an activity"""
+def signup_for_activity(activity_name: str, email: str, token: str = None):
+    """Sign up a student for an activity - only teachers can register students"""
+    # Verify teacher authentication
+    if not token:
+        raise HTTPException(status_code=401, detail="Teacher authentication required")
+    
+    verify_teacher_session(token)
+    
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +182,14 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
-    """Unregister a student from an activity"""
+def unregister_from_activity(activity_name: str, email: str, token: str = None):
+    """Unregister a student from an activity - only teachers can unregister students"""
+    # Verify teacher authentication
+    if not token:
+        raise HTTPException(status_code=401, detail="Teacher authentication required")
+    
+    verify_teacher_session(token)
+    
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
